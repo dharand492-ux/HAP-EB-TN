@@ -1,0 +1,320 @@
+-- database_schema.sql
+-- Complete PostgreSQL schema for TNEB PWA
+
+-- Enable extensions
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";
+
+-- Users table
+CREATE TABLE users (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    email VARCHAR(255) UNIQUE NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    role VARCHAR(20) NOT NULL CHECK (role IN ('ADMIN', 'TL', 'MSP')),
+    mobile VARCHAR(15),
+    assigned_msp VARCHAR(255),
+    locked BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_login TIMESTAMP WITH TIME ZONE,
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Master data table
+CREATE TABLE master_data (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    service_no VARCHAR(50) UNIQUE NOT NULL,
+    abc_code VARCHAR(6) NOT NULL,
+    msp_name VARCHAR(255) NOT NULL,
+    tl_name VARCHAR(255) NOT NULL,
+    tariff VARCHAR(50),
+    sanctioned_load DECIMAL(10,2),
+    sap_code VARCHAR(50),
+    vendor VARCHAR(255),
+    mobile VARCHAR(15),
+    cost_center VARCHAR(100),
+    eb_area VARCHAR(100),
+    consumer_name VARCHAR(255),
+    address TEXT,
+    region VARCHAR(100),
+    circle VARCHAR(100),
+    section VARCHAR(100),
+    gst_number VARCHAR(50),
+    pan_number VARCHAR(50),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Bills table (main billing data)
+CREATE TABLE bills (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    service_no VARCHAR(50) NOT NULL,
+    billing_period VARCHAR(20) NOT NULL,
+    meter_start DECIMAL(12,2),
+    meter_end DECIMAL(12,2),
+    kwh DECIMAL(12,2),
+    kvah DECIMAL(12,2),
+    kw DECIMAL(10,2),
+    kva DECIMAL(10,2),
+    power_factor DECIMAL(4,3),
+    max_demand DECIMAL(10,2),
+    consumption_charges DECIMAL(12,2),
+    fixed_charges DECIMAL(12,2),
+    electricity_tax DECIMAL(12,2),
+    pf_penalty DECIMAL(12,2),
+    excess_demand_penalty DECIMAL(12,2),
+    welding_charges DECIMAL(12,2),
+    bpsc_charges DECIMAL(12,2),
+    deposits DECIMAL(12,2),
+    adjustments DECIMAL(12,2),
+    gst_amount DECIMAL(12,2),
+    arrears DECIMAL(12,2),
+    development_charges DECIMAL(12,2),
+    misc_charges DECIMAL(12,2),
+    bill_amount DECIMAL(12,2) NOT NULL,
+    due_date DATE,
+    paid_amount DECIMAL(12,2),
+    payment_date DATE,
+    payment_status VARCHAR(20) DEFAULT 'UNPAID' CHECK (payment_status IN ('PAID', 'UNPAID', 'PARTIAL')),
+    receipt_numbers TEXT[],
+    scraped_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    source VARCHAR(50) DEFAULT 'SCRAPER',
+    normalized_json JSONB,
+    raw_data JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(service_no, billing_period)
+);
+
+-- Bill history (for monthly snapshots)
+CREATE TABLE bill_history (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    bill_id UUID REFERENCES bills(id) ON DELETE CASCADE,
+    month_year VARCHAR(7) NOT NULL, -- Format: YYYY-MM
+    snapshot_json JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Historical data table (for 24+ months comparison)
+CREATE TABLE historical_data (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    service_no VARCHAR(50) NOT NULL,
+    month_year VARCHAR(7) NOT NULL,
+    kwh DECIMAL(12,2),
+    kvah DECIMAL(12,2),
+    kw DECIMAL(10,2),
+    kva DECIMAL(10,2),
+    power_factor DECIMAL(4,3),
+    demand DECIMAL(10,2),
+    bill_amount DECIMAL(12,2),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(service_no, month_year)
+);
+
+-- Reports table
+CREATE TABLE reports (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    template_json JSONB NOT NULL,
+    visibility_config JSONB,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Templates table
+CREATE TABLE templates (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(50) NOT NULL,
+    version INTEGER DEFAULT 1,
+    content_json JSONB NOT NULL,
+    created_by UUID REFERENCES users(id),
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Downloads table
+CREATE TABLE downloads (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL,
+    service_list TEXT[],
+    file_type VARCHAR(20) NOT NULL,
+    file_path TEXT,
+    file_size BIGINT,
+    status VARCHAR(20) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'PROCESSING', 'COMPLETED', 'FAILED')),
+    job_id VARCHAR(100),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    completed_at TIMESTAMP WITH TIME ZONE
+);
+
+-- Notification rules table
+CREATE TABLE notification_rules (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    description TEXT,
+    rule_type VARCHAR(50) NOT NULL,
+    conditions JSONB NOT NULL,
+    actions JSONB NOT NULL,
+    active BOOLEAN DEFAULT TRUE,
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Notifications table
+CREATE TABLE notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    rule_id UUID REFERENCES notification_rules(id),
+    service_no VARCHAR(50),
+    user_id UUID REFERENCES users(id),
+    priority VARCHAR(10) DEFAULT 'NORMAL' CHECK (priority IN ('LOW', 'NORMAL', 'HIGH', 'CRITICAL')),
+    title VARCHAR(255) NOT NULL,
+    message TEXT NOT NULL,
+    data JSONB,
+    read_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Chat messages table
+CREATE TABLE chat_messages (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    from_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    to_user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    group_id UUID,
+    message TEXT NOT NULL,
+    attachments JSONB,
+    message_type VARCHAR(20) DEFAULT 'TEXT' CHECK (message_type IN ('TEXT', 'FILE', 'IMAGE')),
+    read_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Chat groups table
+CREATE TABLE chat_groups (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    name VARCHAR(255) NOT NULL,
+    type VARCHAR(20) DEFAULT 'GROUP' CHECK (type IN ('DIRECT', 'GROUP', 'TEAM')),
+    members JSONB NOT NULL,
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Activity logs table
+CREATE TABLE activity_logs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL,
+    action_type VARCHAR(50) NOT NULL,
+    details_json JSONB,
+    ip_address INET,
+    user_agent TEXT,
+    timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- System jobs table
+CREATE TABLE system_jobs (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    job_type VARCHAR(50) NOT NULL,
+    status VARCHAR(20) DEFAULT 'PENDING' CHECK (status IN ('PENDING', 'RUNNING', 'COMPLETED', 'FAILED', 'CANCELLED')),
+    progress INTEGER DEFAULT 0,
+    payload_json JSONB,
+    result_json JSONB,
+    error_message TEXT,
+    started_at TIMESTAMP WITH TIME ZONE,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    last_heartbeat TIMESTAMP WITH TIME ZONE
+);
+
+-- Monthly payment reports table
+CREATE TABLE monthly_payment_reports (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    month_year VARCHAR(7) NOT NULL, -- Format: YYYY-MM
+    template_version INTEGER DEFAULT 1,
+    data_json JSONB NOT NULL,
+    extraction_date TIMESTAMP WITH TIME ZONE,
+    status VARCHAR(20) DEFAULT 'DRAFT' CHECK (status IN ('DRAFT', 'PROCESSING', 'COMPLETED', 'ARCHIVED')),
+    total_services INTEGER DEFAULT 0,
+    total_amount DECIMAL(15,2) DEFAULT 0,
+    created_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(month_year)
+);
+
+-- User permissions table (for granular access control)
+CREATE TABLE user_permissions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+    permission_type VARCHAR(50) NOT NULL,
+    resource_type VARCHAR(50),
+    resource_id VARCHAR(100),
+    granted_by UUID REFERENCES users(id),
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    UNIQUE(user_id, permission_type, resource_type, resource_id)
+);
+
+-- Create indexes for performance
+CREATE INDEX idx_users_email ON users(email);
+CREATE INDEX idx_users_role ON users(role);
+
+CREATE INDEX idx_master_data_service_no ON master_data(service_no);
+CREATE INDEX idx_master_data_abc_code ON master_data(abc_code);
+CREATE INDEX idx_master_data_msp_name ON master_data(msp_name);
+CREATE INDEX idx_master_data_tl_name ON master_data(tl_name);
+
+CREATE INDEX idx_bills_service_no ON bills(service_no);
+CREATE INDEX idx_bills_billing_period ON bills(billing_period);
+CREATE INDEX idx_bills_service_period ON bills(service_no, billing_period);
+CREATE INDEX idx_bills_scraped_at ON bills(scraped_at);
+
+CREATE INDEX idx_historical_data_service_no ON historical_data(service_no);
+CREATE INDEX idx_historical_data_month_year ON historical_data(month_year);
+
+CREATE INDEX idx_activity_logs_user_id ON activity_logs(user_id);
+CREATE INDEX idx_activity_logs_timestamp ON activity_logs(timestamp);
+CREATE INDEX idx_activity_logs_action_type ON activity_logs(action_type);
+
+CREATE INDEX idx_notifications_user_id ON notifications(user_id);
+CREATE INDEX idx_notifications_created_at ON notifications(created_at);
+CREATE INDEX idx_notifications_read_at ON notifications(read_at);
+
+CREATE INDEX idx_chat_messages_from_user ON chat_messages(from_user_id);
+CREATE INDEX idx_chat_messages_to_user ON chat_messages(to_user_id);
+CREATE INDEX idx_chat_messages_group_id ON chat_messages(group_id);
+CREATE INDEX idx_chat_messages_created_at ON chat_messages(created_at);
+
+CREATE INDEX idx_downloads_user_id ON downloads(user_id);
+CREATE INDEX idx_downloads_status ON downloads(status);
+CREATE INDEX idx_downloads_created_at ON downloads(created_at);
+
+CREATE INDEX idx_system_jobs_status ON system_jobs(status);
+CREATE INDEX idx_system_jobs_job_type ON system_jobs(job_type);
+CREATE INDEX idx_system_jobs_created_at ON system_jobs(created_at);
+
+CREATE INDEX idx_monthly_reports_month_year ON monthly_payment_reports(month_year);
+CREATE INDEX idx_monthly_reports_status ON monthly_payment_reports(status);
+
+-- Full-text search indexes
+CREATE INDEX idx_master_data_search ON master_data USING gin(to_tsvector('english', service_no || ' ' || abc_code || ' ' || consumer_name || ' ' || msp_name));
+CREATE INDEX idx_activity_logs_search ON activity_logs USING gin(to_tsvector('english', action_type || ' ' || COALESCE(details_json::text, '')));
+
+-- Functions for automatic timestamp updates
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ language 'plpgsql';
+
+-- Triggers for automatic timestamp updates
+CREATE TRIGGER update_users_updated_at BEFORE UPDATE ON users 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_master_data_updated_at BEFORE UPDATE ON master_data 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_bills_updated_at BEFORE UPDATE ON bills 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_
