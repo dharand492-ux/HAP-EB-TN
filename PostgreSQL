@@ -317,4 +317,60 @@ CREATE TRIGGER update_master_data_updated_at BEFORE UPDATE ON master_data
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
 CREATE TRIGGER update_bills_updated_at BEFORE UPDATE ON bills 
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at_
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_reports_updated_at BEFORE UPDATE ON reports 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_monthly_reports_updated_at BEFORE UPDATE ON monthly_payment_reports 
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- Sample data inserts
+INSERT INTO users (email, name, role, mobile) VALUES 
+('admin@tneb.com', 'System Admin', 'ADMIN', '9876543210'),
+('tl1@tneb.com', 'Team Leader 1', 'TL', '9876543211'),
+('msp1@tneb.com', 'MSP Agent 1', 'MSP', '9876543212'),
+('msp2@tneb.com', 'MSP Agent 2', 'MSP', '9876543213');
+
+-- Sample master data
+INSERT INTO master_data (service_no, abc_code, msp_name, tl_name, tariff, sanctioned_load, consumer_name, mobile) VALUES
+('100001234567', '123456', 'MSP Agent 1', 'Team Leader 1', 'LT-IA', 25.00, 'Sample Consumer 1', '9123456789'),
+('100001234568', '123456', 'MSP Agent 1', 'Team Leader 1', 'LT-IIA', 50.00, 'Sample Consumer 2', '9123456790'),
+('100001234569', '123457', 'MSP Agent 2', 'Team Leader 1', 'HT-I', 100.00, 'Sample Consumer 3', '9123456791');
+
+-- Sample notification rules
+INSERT INTO notification_rules (name, description, rule_type, conditions, actions, created_by) VALUES
+('Low Power Factor Alert', 'Alert when power factor falls below 0.85', 'PF_THRESHOLD', 
+ '{"threshold": 0.85, "operator": "less_than", "field": "power_factor"}',
+ '{"notify_msp": true, "notify_tl": true, "priority": "HIGH"}',
+ (SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1)),
+
+('High Bill Amount Alert', 'Alert when bill amount increases by more than 50%', 'BILL_SPIKE',
+ '{"threshold": 50, "operator": "percent_increase", "field": "bill_amount", "comparison_period": "previous_month"}',
+ '{"notify_msp": true, "notify_tl": true, "priority": "NORMAL"}',
+ (SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1)),
+
+('Overdue Payment Alert', 'Alert for bills overdue by more than 30 days', 'OVERDUE_PAYMENT',
+ '{"threshold": 30, "operator": "days_overdue", "field": "due_date"}',
+ '{"notify_msp": true, "notify_tl": true, "priority": "CRITICAL"}',
+ (SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1));
+
+-- Sample templates
+INSERT INTO templates (name, type, content_json, created_by) VALUES
+('Default Cost Report', 'COST_REPORT',
+ '{"columns": ["service_no", "consumer_name", "billing_period", "kwh", "bill_amount", "due_date"], 
+   "formulas": {"delta_bill": "current_amount - previous_amount", "percent_change": "(delta_bill / previous_amount) * 100"},
+   "layout": {"title": "Cost Analysis Report", "show_summary": true, "group_by": "msp_name"}}',
+ (SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1)),
+
+('Power Factor Analysis', 'PF_REPORT',
+ '{"columns": ["service_no", "consumer_name", "billing_period", "kw", "kva", "power_factor", "pf_penalty"],
+   "formulas": {"calculated_pf": "kw / kva", "penalty_percent": "(pf_penalty / bill_amount) * 100"},
+   "layout": {"title": "Power Factor Analysis", "highlight_low_pf": true, "pf_threshold": 0.85}}',
+ (SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1)),
+
+('Monthly Payment Report Template', 'MONTHLY_PAYMENT',
+ '{"columns": ["service_no", "consumer_name", "abc_code", "msp_name", "billing_period", "bill_amount", "paid_amount", "payment_date", "payment_status", "arrears"],
+   "formulas": {"outstanding": "bill_amount - paid_amount", "days_overdue": "CURRENT_DATE - due_date"},
+   "layout": {"title": "Monthly Payment Report", "show_totals": true, "group_by": ["msp_name", "payment_status"]}}',
+ (SELECT id FROM users WHERE role = 'ADMIN' LIMIT 1));
