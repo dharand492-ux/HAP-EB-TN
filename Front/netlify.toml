@@ -6,7 +6,7 @@
 [build.environment]
   NODE_VERSION = "18"
 
-# PWA Headers
+# PWA + Security Headers
 [[headers]]
   for = "/*"
   [headers.values]
@@ -30,13 +30,13 @@
   [headers.values]
     Cache-Control = "public, max-age=31536000, immutable"
 
-# SPA Redirects
+# SPA Fallback (all client-side routes → index.html)
 [[redirects]]
   from = "/*"
   to = "/index.html"
   status = 200
 
-# API Redirects
+# API Functions
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/:splat"
