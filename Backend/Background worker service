@@ -1,0 +1,716 @@
+// workers/main.js - Background job processor
+const Bull = require('bull');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const puppeteer = require('puppeteer');
+const { Pool } = require('pg');
+const redis = require('redis');
+const XLSX = require('xlsx');
+const PDFDocument = require('pdfkit');
+const fs = require('fs');
+const path = require('path');
+const moment = require('moment');
+require('dotenv').config();
+
+// Database connection
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+// Redis connection
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+// Job queues
+const scrapeQueue = new Bull('scrape queue', process.env.REDIS_URL);
+const reportQueue = new Bull('report queue', process.env.REDIS_URL);
+const notificationQueue = new Bull('notification queue', process.env.REDIS_URL);
+const monthlyReportQueue = new Bull('monthly report queue', process.env.REDIS_URL);
+
+// Scraping job processor
+scrapeQueue.process('single-bill', async (job) => {
+  const { serviceNo, userId, mobile } = job.data;
+  
+  try {
+    // Update job progress
+    job.progress(10);
+    
+    // Initialize browser
+    const browser = await puppeteer.launch({
+      headless: true,
+      args: ['--no-sandbox', '--disable-setuid-sandbox']
+    });
+    
+    const page = await browser.newPage();
+    await page.setUserAgent(process.env.USER_AGENT);
+    
+    job.progress(20);
+    
+    // Navigate to TNEB portal
+    await page.goto(process.env.TNEB_BASE_URL + '/consumer', {
+      waitUntil: 'networkidle2',
+      timeout: 30000
+    });
+    
+    job.progress(40);
+    
+    // Fill service number and mobile
+    await page.type('#serviceNumber', serviceNo);
+    if (mobile) {
+      await page.type('#mobileNumber', mobile);
+    }
+    
+    // Handle CAPTCHA if present (simplified)
+    const captchaExists = await page.$('#captcha') !== null;
+    if (captchaExists) {
+      // In production, implement CAPTCHA solving service or manual intervention
+      throw new Error('CAPTCHA verification required');
+    }
+    
+    // Submit form
+    await page.click('#submitBtn');
+    await page.waitForNavigation({ waitUntil: 'networkidle2' });
+    
+    job.progress(60);
+    
+    // Extract bill data
+    const billData = await page.evaluate(() => {
+      const data = {};
+      
+      // Extract consumer details
+      data.consumerName = document.querySelector('.consumer-name')?.textContent?.trim() || '';
+      data.serviceNo = document.querySelector('.service-number')?.textContent?.trim() || '';
+      data.address = document.querySelector('.address')?.textContent?.trim() || '';
+      
+      // Extract current bill data
+      const billRows = document.querySelectorAll('.bill-table tbody tr');
+      if (billRows.length > 0) {
+        const latestBill = billRows[0];
+        const cells = latestBill.querySelectorAll('td');
+        
+        data.billingPeriod = cells[0]?.textContent?.trim() || '';
+        data.kwh = parseFloat(cells[1]?.textContent?.replace(/,/g, '') || '0');
+        data.kvah = parseFloat(cells[2]?.textContent?.replace(/,/g, '') || '0');
+        data.kw = parseFloat(cells[3]?.textContent?.replace(/,/g, '') || '0');
+        data.kva = parseFloat(cells[4]?.textContent?.replace(/,/g, '') || '0');
+        data.powerFactor = parseFloat(cells[5]?.textContent || '0');
+        data.billAmount = parseFloat(cells[6]?.textContent?.replace(/,/g, '') || '0');
+        data.dueDate = cells[7]?.textContent?.trim() || '';
+      }
+      
+      // Extract charges breakdown
+      const chargesRows = document.querySelectorAll('.charges-table tbody tr');
+      data.charges = {};
+      chargesRows.forEach(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length >= 2) {
+          const chargeType = cells[0]?.textContent?.trim() || '';
+          const amount = parseFloat(cells[1]?.textContent?.replace(/,/g, '') || '0');
+          data.charges[chargeType] = amount;
+        }
+      });
+      
+      // Extract historical data (up to 24 months)
+      const historyRows = document.querySelectorAll('.history-table tbody tr');
+      data.history = [];
+      historyRows.forEach(row => {
+        const cells = row.querySelectorAll('td');
+        if (cells.length >= 6) {
+          data.history.push({
+            period: cells[0]?.textContent?.trim() || '',
+            kwh: parseFloat(cells[1]?.textContent?.replace(/,/g, '') || '0'),
+            kvah: parseFloat(cells[2]?.textContent?.replace(/,/g, '') || '0'),
+            kw: parseFloat(cells[3]?.textContent?.replace(/,/g, '') || '0'),
+            kva: parseFloat(cells[4]?.textContent?.replace(/,/g, '') || '0'),
+            amount: parseFloat(cells[5]?.textContent?.replace(/,/g, '') || '0')
+          });
+        }
+      });
+      
+      return data;
+    });
+    
+    job.progress(80);
+    
+    // Store in database
+    if (billData.billingPeriod) {
+      // Calculate power factor if not present
+      if (!billData.powerFactor && billData.kw && billData.kva) {
+        billData.powerFactor = billData.kw / billData.kva;
+      }
+      
+      // Insert main bill record
+      const insertQuery = `
+        INSERT INTO bills (
+          service_no, billing_period, kwh, kvah, kw, kva, power_factor,
+          consumption_charges, fixed_charges, electricity_tax, pf_penalty,
+          excess_demand_penalty, welding_charges, bill_amount, due_date,
+          scraped_at, source, normalized_json
+        ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), 'SCRAPER', $16)
+        ON CONFLICT (service_no, billing_period) 
+        DO UPDATE SET 
+          kwh = EXCLUDED.kwh, kvah = EXCLUDED.kvah, kw = EXCLUDED.kw, 
+          kva = EXCLUDED.kva, power_factor = EXCLUDED.power_factor,
+          bill_amount = EXCLUDED.bill_amount, updated_at = NOW()
+      `;
+      
+      const values = [
+        serviceNo,
+        billData.billingPeriod,
+        billData.kwh || 0,
+        billData.kvah || 0,
+        billData.kw || 0,
+        billData.kva || 0,
+        billData.powerFactor || 0,
+        billData.charges['Consumption Charges'] || 0,
+        billData.charges['Fixed Charges'] || 0,
+        billData.charges['Electricity Tax'] || 0,
+        billData.charges['PF Penalty'] || 0,
+        billData.charges['Excess Demand Penalty'] || 0,
+        billData.charges['Welding Charges'] || 0,
+        billData.billAmount || 0,
+        billData.dueDate || null,
+        JSON.stringify(billData)
+      ];
+      
+      await db.query(insertQuery, values);
+      
+      // Store historical data
+      if (billData.history && billData.history.length > 0) {
+        for (const histItem of billData.history) {
+          await db.query(`
+            INSERT INTO historical_data (service_no, month_year, kwh, kvah, kw, kva, bill_amount)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (service_no, month_year) 
+            DO UPDATE SET kwh = EXCLUDED.kwh, kvah = EXCLUDED.kvah, 
+                         kw = EXCLUDED.kw, kva = EXCLUDED.kva, bill_amount = EXCLUDED.bill_amount
+          `, [
+            serviceNo,
+            histItem.period,
+            histItem.kwh,
+            histItem.kvah,
+            histItem.kw,
+            histItem.kva,
+            histItem.amount
+          ]);
+        }
+      }
+    }
+    
+    await browser.close();
+    job.progress(100);
+    
+    // Log activity
+    await db.query(
+      'INSERT INTO activity_logs (user_id, role, action_type, details_json, timestamp) VALUES ($1, $2, $3, $4, NOW())',
+      [userId, 'SYSTEM', 'SCRAPE_COMPLETED', JSON.stringify({ serviceNo, success: true })]
+    );
+    
+    // Check for notifications
+    await checkNotifications(serviceNo, billData);
+    
+    return { success: true, serviceNo, data: billData };
+    
+  } catch (error) {
+    // Log error
+    await db.query(
+      'INSERT INTO activity_logs (user_id, role, action_type, details_json, timestamp) VALUES ($1, $2, $3, $4, NOW())',
+      [userId, 'SYSTEM', 'SCRAPE_FAILED', JSON.stringify({ serviceNo, error: error.message })]
+    );
+    
+    throw error;
+  }
+});
+
+// Batch scraping processor
+scrapeQueue.process('batch-bills', async (job) => {
+  const { serviceNumbers, userId } = job.data;
+  const results = [];
+  const total = serviceNumbers.length;
+  
+  for (let i = 0; i < total; i++) {
+    try {
+      job.progress(Math.round((i / total) * 100));
+      
+      // Add delay between scrapes
+      if (i > 0) {
+        const delay = Math.random() * (5000 - 2000) + 2000; // 2-5 seconds
+        await new Promise(resolve => setTimeout(resolve, delay));
+      }
+      
+      // Process individual service
+      const singleJob = await scrapeQueue.add('single-bill', {
+        serviceNo: serviceNumbers[i],
+        userId
+      });
+      
+      const result = await singleJob.finished();
+      results.push(result);
+      
+    } catch (error) {
+      results.push({ success: false, serviceNo: serviceNumbers[i], error: error.message });
+    }
+  }
+  
+  job.progress(100);
+  return { success: true, results, total, processed: results.length };
+});
+
+// Report generation processor
+reportQueue.process('generate-report', async (job) => {
+  const { reportType, filters, userId, templateId } = job.data;
+  
+  try {
+    job.progress(10);
+    
+    // Get template
+    const templateResult = await db.query('SELECT * FROM templates WHERE id = $1', [templateId]);
+    const template = templateResult.rows[0];
+    
+    if (!template) {
+      throw new Error('Template not found');
+    }
+    
+    const config = template.content_json;
+    
+    job.progress(30);
+    
+    // Build query based on filters and template
+    let query = `
+      SELECT b.*, md.consumer_name, md.msp_name, md.tl_name, md.abc_code
+      FROM bills b
+      LEFT JOIN master_data md ON b.service_no = md.service_no
+      WHERE 1=1
+    `;
+    const params = [];
+    
+    // Apply RBAC filters
+    const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const user = userResult.rows[0];
+    
+    if (user.role === 'MSP') {
+      query += ` AND md.msp_name = $${params.length + 1}`;
+      params.push(user.name);
+    } else if (user.role === 'TL') {
+      query += ` AND md.tl_name = $${params.length + 1}`;
+      params.push(user.name);
+    }
+    
+    // Apply date filters
+    if (filters.startDate) {
+      query += ` AND b.billing_period >= $${params.length + 1}`;
+      params.push(filters.startDate);
+    }
+    
+    if (filters.endDate) {
+      query += ` AND b.billing_period <= $${params.length + 1}`;
+      params.push(filters.endDate);
+    }
+    
+    // Apply service filters
+    if (filters.serviceNumbers && filters.serviceNumbers.length > 0) {
+      query += ` AND b.service_no = ANY($${params.length + 1})`;
+      params.push(filters.serviceNumbers);
+    }
+    
+    query += ' ORDER BY b.service_no, b.billing_period DESC';
+    
+    job.progress(50);
+    
+    const result = await db.query(query, params);
+    const data = result.rows;
+    
+    job.progress(70);
+    
+    // Generate Excel file
+    const workbook = XLSX.utils.book_new();
+    
+    // Prepare data with calculated fields
+    const processedData = data.map(row => {
+      const processed = {};
+      
+      // Include selected columns
+      config.columns.forEach(col => {
+        processed[col] = row[col] || '';
+      });
+      
+      // Apply formulas if defined
+      if (config.formulas) {
+        Object.keys(config.formulas).forEach(formulaKey => {
+          // Simplified formula calculation
+          if (formulaKey === 'calculated_pf' && row.kw && row.kva) {
+            processed[formulaKey] = (row.kw / row.kva).toFixed(3);
+          }
+          // Add more formula implementations as needed
+        });
+      }
+      
+      return processed;
+    });
+    
+    const worksheet = XLSX.utils.json_to_sheet(processedData);
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Report');
+    
+    // Generate filename
+    const filename = `${reportType}_${moment().format('YYYY-MM-DD_HH-mm')}.xlsx`;
+    const filepath = path.join(process.env.UPLOAD_DIR || 'uploads', filename);
+    
+    // Ensure upload directory exists
+    if (!fs.existsSync(path.dirname(filepath))) {
+      fs.mkdirSync(path.dirname(filepath), { recursive: true });
+    }
+    
+    XLSX.writeFile(workbook, filepath);
+    
+    job.progress(90);
+    
+    // Save download record
+    const downloadResult = await db.query(`
+      INSERT INTO downloads (user_id, role, file_type, file_path, status, completed_at)
+      VALUES ($1, $2, 'EXCEL', $3, 'COMPLETED', NOW())
+      RETURNING id
+    `, [userId, user.role, filepath]);
+    
+    const downloadId = downloadResult.rows[0].id;
+    
+    job.progress(100);
+    
+    return { success: true, downloadId, filename, recordCount: data.length };
+    
+  } catch (error) {
+    console.error('Report generation error:', error);
+    throw error;
+  }
+});
+
+// Monthly report processor
+monthlyReportQueue.process('generate-monthly-report', async (job) => {
+  const { monthYear, userId, templateId } = job.data;
+  
+  try {
+    job.progress(5);
+    
+    // Get all services for the month
+    const servicesQuery = `
+      SELECT DISTINCT md.service_no, md.consumer_name, md.abc_code, md.msp_name, md.tl_name
+      FROM master_data md
+    `;
+    
+    const servicesResult = await db.query(servicesQuery);
+    const services = servicesResult.rows;
+    const total = services.length;
+    
+    job.progress(10);
+    
+    const reportData = [];
+    
+    // Process each service
+    for (let i = 0; i < total; i++) {
+      const service = services[i];
+      
+      // Update progress
+      job.progress(10 + Math.round((i / total) * 80));
+      
+      try {
+        // Get bill data for the month
+        const billQuery = `
+          SELECT * FROM bills 
+          WHERE service_no = $1 AND billing_period LIKE $2
+          ORDER BY billing_period DESC LIMIT 1
+        `;
+        
+        const billResult = await db.query(billQuery, [service.service_no, `${monthYear}%`]);
+        
+        if (billResult.rows.length > 0) {
+          const bill = billResult.rows[0];
+          
+          reportData.push({
+            service_no: service.service_no,
+            consumer_name: service.consumer_name,
+            abc_code: service.abc_code,
+            msp_name: service.msp_name,
+            tl_name: service.tl_name,
+            billing_period: bill.billing_period,
+            kwh: bill.kwh,
+            kvah: bill.kvah,
+            kw: bill.kw,
+            kva: bill.kva,
+            power_factor: bill.power_factor,
+            bill_amount: bill.bill_amount,
+            paid_amount: bill.paid_amount,
+            payment_date: bill.payment_date,
+            payment_status: bill.payment_status,
+            due_date: bill.due_date,
+            arrears: bill.arrears || 0,
+            pf_penalty: bill.pf_penalty || 0,
+            excess_demand_penalty: bill.excess_demand_penalty || 0,
+            outstanding: (bill.bill_amount || 0) - (bill.paid_amount || 0),
+            extraction_date: new Date().toISOString()
+          });
+        }
+        
+      } catch (serviceError) {
+        console.error(`Error processing service ${service.service_no}:`, serviceError);
+        // Continue with next service
+      }
+    }
+    
+    job.progress(95);
+    
+    // Save monthly report
+    const saveResult = await db.query(`
+      INSERT INTO monthly_payment_reports (month_year, data_json, extraction_date, total_services, total_amount, created_by, status)
+      VALUES ($1, $2, NOW(), $3, $4, $5, 'COMPLETED')
+      ON CONFLICT (month_year) 
+      DO UPDATE SET 
+        data_json = EXCLUDED.data_json,
+        extraction_date = EXCLUDED.extraction_date,
+        total_services = EXCLUDED.total_services,
+        total_amount = EXCLUDED.total_amount,
+        updated_at = NOW()
+      RETURNING id
+    `, [
+      monthYear,
+      JSON.stringify(reportData),
+      reportData.length,
+      reportData.reduce((sum, item) => sum + (item.bill_amount || 0), 0),
+      userId
+    ]);
+    
+    job.progress(100);
+    
+    return { 
+      success: true, 
+      reportId: saveResult.rows[0].id,
+      servicesProcessed: reportData.length,
+      monthYear 
+    };
+    
+  } catch (error) {
+    console.error('Monthly report generation error:', error);
+    throw error;
+  }
+});
+
+// Notification checker
+async function checkNotifications(serviceNo, billData) {
+  try {
+    // Get active notification rules
+    const rulesResult = await db.query('SELECT * FROM notification_rules WHERE active = true');
+    const rules = rulesResult.rows;
+    
+    for (const rule of rules) {
+      const conditions = rule.conditions;
+      let shouldNotify = false;
+      let message = '';
+      
+      // Check Power Factor threshold
+      if (rule.rule_type === 'PF_THRESHOLD' && billData.powerFactor) {
+        if (billData.powerFactor < conditions.threshold) {
+          shouldNotify = true;
+          message = `Low Power Factor Alert: ${billData.powerFactor.toFixed(3)} (Threshold: ${conditions.threshold})`;
+        }
+      }
+      
+      // Check Bill amount spike
+      if (rule.rule_type === 'BILL_SPIKE' && billData.billAmount) {
+        // Get previous month's bill for comparison
+        const prevBillResult = await db.query(`
+          SELECT bill_amount FROM bills 
+          WHERE service_no = $1 AND billing_period < $2 
+          ORDER BY billing_period DESC LIMIT 1
+        `, [serviceNo, billData.billingPeriod]);
+        
+        if (prevBillResult.rows.length > 0) {
+          const prevAmount = prevBillResult.rows[0].bill_amount;
+          const increase = ((billData.billAmount - prevAmount) / prevAmount) * 100;
+          
+          if (increase > conditions.threshold) {
+            shouldNotify = true;
+            message = `Bill Amount Spike Alert: ${increase.toFixed(1)}% increase (Threshold: ${conditions.threshold}%)`;
+          }
+        }
+      }
+      
+      // Check Overdue payment
+      if (rule.rule_type === 'OVERDUE_PAYMENT' && billData.dueDate) {
+        const dueDate = new Date(billData.dueDate);
+        const daysDiff = Math.floor((new Date() - dueDate) / (1000 * 60 * 60 * 24));
+        
+        if (daysDiff > conditions.threshold) {
+          shouldNotify = true;
+          message = `Overdue Payment Alert: ${daysDiff} days overdue (Threshold: ${conditions.threshold} days)`;
+        }
+      }
+      
+      if (shouldNotify) {
+        // Get MSP and TL for this service
+        const userResult = await db.query(`
+          SELECT u1.id as msp_id, u2.id as tl_id
+          FROM master_data md
+          LEFT JOIN users u1 ON md.msp_name = u1.name AND u1.role = 'MSP'
+          LEFT JOIN users u2 ON md.tl_name = u2.name AND u2.role = 'TL'
+          WHERE md.service_no = $1
+        `, [serviceNo]);
+        
+        if (userResult.rows.length > 0) {
+          const { msp_id, tl_id } = userResult.rows[0];
+          const actions = rule.actions;
+          
+          // Create notifications
+          if (actions.notify_msp && msp_id) {
+            await db.query(`
+              INSERT INTO notifications (rule_id, service_no, user_id, priority, title, message, data)
+              VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `, [
+              rule.id,
+              serviceNo,
+              msp_id,
+              actions.priority || 'NORMAL',
+              rule.name,
+              message,
+              JSON.stringify(billData)
+            ]);
+          }
+          
+          if (actions.notify_tl && tl_id) {
+            await db.query(`
+              INSERT INTO notifications (rule_id, service_no, user_id, priority, title, message, data)
+              VALUES ($1, $2, $3, $4, $5, $6, $7)
+            `, [
+              rule.id,
+              serviceNo,
+              tl_id,
+              actions.priority || 'NORMAL',
+              rule.name,
+              message,
+              JSON.stringify(billData)
+            ]);
+          }
+        }
+      }
+    }
+    
+  } catch (error) {
+    console.error('Notification check error:', error);
+  }
+}
+
+// Notification processor
+notificationQueue.process('send-notification', async (job) => {
+  const { notificationId } = job.data;
+  
+  try {
+    // Get notification details
+    const notResult = await db.query(`
+      SELECT n.*, u.email, u.name as user_name, u.mobile
+      FROM notifications n
+      LEFT JOIN users u ON n.user_id = u.id
+      WHERE n.id = $1
+    `, [notificationId]);
+    
+    if (notResult.rows.length === 0) {
+      throw new Error('Notification not found');
+    }
+    
+    const notification = notResult.rows[0];
+    
+    // TODO: Implement actual notification sending (email, SMS, push)
+    // For now, just log
+    console.log(`Notification sent to ${notification.email}: ${notification.message}`);
+    
+    return { success: true, notificationId };
+    
+  } catch (error) {
+    console.error('Notification send error:', error);
+    throw error;
+  }
+});
+
+// Cleanup jobs
+const cleanupQueue = new Bull('cleanup queue', process.env.REDIS_URL);
+
+cleanupQueue.process('cleanup-old-logs', async (job) => {
+  try {
+    const retentionDays = 90; // Keep logs for 90 days
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - retentionDays);
+    
+    const result = await db.query(
+      'DELETE FROM activity_logs WHERE timestamp < $1',
+      [cutoffDate]
+    );
+    
+    console.log(`Cleaned up ${result.rowCount} old activity logs`);
+    
+    return { success: true, deletedCount: result.rowCount };
+    
+  } catch (error) {
+    console.error('Cleanup error:', error);
+    throw error;
+  }
+});
+
+// Schedule recurring jobs
+const CronJob = require('cron').CronJob;
+
+// Daily cleanup at 2 AM
+new CronJob('0 2 * * *', () => {
+  cleanupQueue.add('cleanup-old-logs', {});
+}, null, true);
+
+// Monthly report generation on 1st of each month at 6 AM
+new CronJob('0 6 1 * *', async () => {
+  const prevMonth = moment().subtract(1, 'month').format('YYYY-MM');
+  const adminUser = await db.query('SELECT id FROM users WHERE role = \'ADMIN\' LIMIT 1');
+  
+  if (adminUser.rows.length > 0) {
+    monthlyReportQueue.add('generate-monthly-report', {
+      monthYear: prevMonth,
+      userId: adminUser.rows[0].id
+    });
+  }
+}, null, true);
+
+// Error handlers
+scrapeQueue.on('failed', (job, err) => {
+  console.error(`Scrape job ${job.id} failed:`, err.message);
+});
+
+reportQueue.on('failed', (job, err) => {
+  console.error(`Report job ${job.id} failed:`, err.message);
+});
+
+monthlyReportQueue.on('failed', (job, err) => {
+  console.error(`Monthly report job ${job.id} failed:`, err.message);
+});
+
+notificationQueue.on('failed', (job, err) => {
+  console.error(`Notification job ${job.id} failed:`, err.message);
+});
+
+// Graceful shutdown
+process.on('SIGTERM', async () => {
+  console.log('Worker received SIGTERM, shutting down gracefully');
+  await scrapeQueue.close();
+  await reportQueue.close();
+  await monthlyReportQueue.close();
+  await notificationQueue.close();
+  await cleanupQueue.close();
+  await db.end();
+  await redisClient.quit();
+  process.exit(0);
+});
+
+console.log('Background workers started successfully');
+console.log('Available queues: scrape, report, monthly-report, notification, cleanup');
+
+module.exports = {
+  scrapeQueue,
+  reportQueue,
+  monthlyReportQueue,
+  notificationQueue,
+  cleanupQueue
+};
