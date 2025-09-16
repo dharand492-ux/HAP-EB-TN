@@ -1,0 +1,475 @@
+// server.js - Main backend server
+const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
+const compression = require('compression');
+const cookieParser = require('cookie-parser');
+const { Pool } = require('pg');
+const redis = require('redis');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const multer = require('multer');
+const path = require('path');
+require('dotenv').config();
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+// Database connections
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false
+});
+
+const redisClient = redis.createClient({
+  url: process.env.REDIS_URL || 'redis://localhost:6379'
+});
+
+// Middleware
+app.use(helmet());
+app.use(compression());
+app.use(cors({
+  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  credentials: true
+}));
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
+app.use(cookieParser());
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  message: 'Too many requests from this IP'
+});
+app.use('/api/', limiter);
+
+// File upload configuration
+const upload = multer({
+  dest: 'uploads/',
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB
+  fileFilter: (req, file, cb) => {
+    const allowedTypes = /jpeg|jpg|png|pdf|xlsx|csv/;
+    const extname = allowedTypes.test(path.extname(file.originalname).toLowerCase());
+    const mimetype = allowedTypes.test(file.mimetype);
+    
+    if (mimetype && extname) {
+      return cb(null, true);
+    } else {
+      cb(new Error('Invalid file type'));
+    }
+  }
+});
+
+// Authentication middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+  
+  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Invalid token' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// Role-based access control
+const requireRole = (roles) => {
+  return (req, res, next) => {
+    if (!roles.includes(req.user.role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
+  };
+};
+
+// Routes
+
+// Health check
+app.get('/api/health', async (req, res) => {
+  try {
+    await db.query('SELECT 1');
+    await redisClient.ping();
+    res.json({ 
+      status: 'healthy', 
+      timestamp: new Date().toISOString(),
+      services: {
+        database: 'connected',
+        redis: 'connected'
+      }
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      status: 'unhealthy', 
+      error: error.message 
+    });
+  }
+});
+
+// Authentication routes
+app.post('/api/auth/magic-link', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    // Validate email
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+      return res.status(400).json({ error: 'Invalid email format' });
+    }
+    
+    // Check if user exists
+    const userResult = await db.query('SELECT * FROM users WHERE email = $1', [email]);
+    
+    if (userResult.rows.length === 0) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+    
+    const user = userResult.rows[0];
+    
+    // Generate magic token
+    const magicToken = jwt.sign(
+      { userId: user.id, email: user.email },
+      process.env.JWT_SECRET,
+      { expiresIn: '15m' }
+    );
+    
+    // Store token in Redis with expiration
+    await redisClient.setEx(`magic:${magicToken}`, 900, user.id); // 15 minutes
+    
+    // TODO: Send email with magic link
+    const magicLink = `${process.env.FRONTEND_URL}/auth/verify?token=${magicToken}`;
+    console.log('Magic link:', magicLink); // In production, send via email service
+    
+    res.json({ message: 'Magic link sent to your email' });
+  } catch (error) {
+    console.error('Magic link error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+app.get('/api/auth/verify', async (req, res) => {
+  try {
+    const { token } = req.query;
+    
+    if (!token) {
+      return res.status(400).json({ error: 'Token required' });
+    }
+    
+    // Verify magic token
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    
+    // Check if token exists in Redis
+    const storedUserId = await redisClient.get(`magic:${token}`);
+    if (!storedUserId) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+    
+    // Get user details
+    const userResult = await db.query('SELECT * FROM users WHERE id = $1', [decoded.userId]);
+    const user = userResult.rows[0];
+    
+    // Generate access token
+    const accessToken = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email, 
+        role: user.role,
+        name: user.name 
+      },
+      process.env.JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+    
+    // Update last login
+    await db.query('UPDATE users SET last_login = NOW() WHERE id = $1', [user.id]);
+    
+    // Remove magic token from Redis
+    await redisClient.del(`magic:${token}`);
+    
+    // Log activity
+    await logActivity(user.id, user.role, 'LOGIN', { ip: req.ip });
+    
+    res.json({
+      token: accessToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        mobile: user.mobile
+      }
+    });
+  } catch (error) {
+    console.error('Auth verify error:', error);
+    res.status(401).json({ error: 'Invalid token' });
+  }
+});
+
+// Search routes
+app.get('/api/search', authenticateToken, async (req, res) => {
+  try {
+    const { service, mobile, abc } = req.query;
+    const userId = req.user.userId;
+    
+    let query = `
+      SELECT md.*, u.name as msp_name, u2.name as tl_name
+      FROM master_data md
+      LEFT JOIN users u ON md.msp_name = u.name AND u.role = 'MSP'
+      LEFT JOIN users u2 ON md.tl_name = u2.name AND u2.role = 'TL'
+      WHERE 1=1
+    `;
+    const params = [];
+    
+    // Apply RBAC filters
+    const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+    const user = userResult.rows[0];
+    
+    if (user.role === 'MSP') {
+      query += ` AND md.msp_name = $${params.length + 1}`;
+      params.push(user.name);
+    } else if (user.role === 'TL') {
+      query += ` AND md.tl_name = $${params.length + 1}`;
+      params.push(user.name);
+    }
+    
+    // Add search filters
+    if (service) {
+      query += ` AND md.service_no ILIKE $${params.length + 1}`;
+      params.push(`%${service}%`);
+    }
+    
+    if (mobile) {
+      query += ` AND md.mobile ILIKE $${params.length + 1}`;
+      params.push(`%${mobile}%`);
+    }
+    
+    if (abc) {
+      query += ` AND md.abc_code = $${params.length + 1}`;
+      params.push(abc);
+    }
+    
+    query += ' ORDER BY md.service_no LIMIT 100';
+    
+    const result = await db.query(query, params);
+    
+    // Log search activity
+    await logActivity(userId, user.role, 'SEARCH', { 
+      service, mobile, abc, 
+      results_count: result.rows.length 
+    });
+    
+    res.json({
+      results: result.rows,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error('Search error:', error);
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// ABC autofill route
+app.get('/api/autofill/:abc', authenticateToken, async (req, res) => {
+  try {
+    const { abc } = req.params;
+    
+    if (abc.length !== 6) {
+      return res.status(400).json({ error: 'ABC code must be 6 digits' });
+    }
+    
+    const result = await db.query(
+      'SELECT service_no, mobile FROM master_data WHERE abc_code = $1 LIMIT 1',
+      [abc]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.json({ service_no: '', mobile: '' });
+    }
+    
+    res.json(result.rows[0]);
+  } catch (error) {
+    console.error('Autofill error:', error);
+    res.status(500).json({ error: 'Autofill failed' });
+  }
+});
+
+// Bills route
+app.get('/api/bills/:service', authenticateToken, async (req, res) => {
+  try {
+    const { service } = req.params;
+    const { period, limit = 24 } = req.query;
+    
+    // Check access permissions
+    const hasAccess = await checkServiceAccess(req.user.userId, req.user.role, service);
+    if (!hasAccess) {
+      return res.status(403).json({ error: 'Access denied to this service' });
+    }
+    
+    let query = `
+      SELECT * FROM bills 
+      WHERE service_no = $1
+    `;
+    const params = [service];
+    
+    if (period) {
+      query += ` AND billing_period = $2`;
+      params.push(period);
+    }
+    
+    query += ` ORDER BY billing_period DESC LIMIT $${params.length + 1}`;
+    params.push(parseInt(limit));
+    
+    const result = await db.query(query, params);
+    
+    res.json({
+      bills: result.rows,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error('Bills fetch error:', error);
+    res.status(500).json({ error: 'Failed to fetch bills' });
+  }
+});
+
+// Master data routes (Admin only)
+app.get('/api/master-data', authenticateToken, requireRole(['ADMIN']), async (req, res) => {
+  try {
+    const { page = 1, limit = 100, search } = req.query;
+    const offset = (page - 1) * limit;
+    
+    let query = 'SELECT * FROM master_data';
+    let countQuery = 'SELECT COUNT(*) FROM master_data';
+    const params = [];
+    
+    if (search) {
+      const searchCondition = ` WHERE service_no ILIKE $1 OR abc_code ILIKE $1 OR msp_name ILIKE $1`;
+      query += searchCondition;
+      countQuery += searchCondition;
+      params.push(`%${search}%`);
+    }
+    
+    query += ` ORDER BY service_no LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(parseInt(limit), offset);
+    
+    const [dataResult, countResult] = await Promise.all([
+      db.query(query, params),
+      db.query(countQuery, search ? [`%${search}%`] : [])
+    ]);
+    
+    res.json({
+      data: dataResult.rows,
+      total: parseInt(countResult.rows[0].count),
+      page: parseInt(page),
+      pages: Math.ceil(countResult.rows[0].count / limit)
+    });
+  } catch (error) {
+    console.error('Master data error:', error);
+    res.status(500).json({ error: 'Failed to fetch master data' });
+  }
+});
+
+// Activity logs (Admin only)
+app.get('/api/activity-logs', authenticateToken, requireRole(['ADMIN']), async (req, res) => {
+  try {
+    const { page = 1, limit = 100, user_id, action_type, start_date, end_date } = req.query;
+    const offset = (page - 1) * limit;
+    
+    let query = `
+      SELECT al.*, u.name as user_name, u.email as user_email
+      FROM activity_logs al
+      LEFT JOIN users u ON al.user_id = u.id
+      WHERE 1=1
+    `;
+    const params = [];
+    
+    if (user_id) {
+      query += ` AND al.user_id = $${params.length + 1}`;
+      params.push(user_id);
+    }
+    
+    if (action_type) {
+      query += ` AND al.action_type = $${params.length + 1}`;
+      params.push(action_type);
+    }
+    
+    if (start_date) {
+      query += ` AND al.timestamp >= $${params.length + 1}`;
+      params.push(start_date);
+    }
+    
+    if (end_date) {
+      query += ` AND al.timestamp <= $${params.length + 1}`;
+      params.push(end_date);
+    }
+    
+    query += ` ORDER BY al.timestamp DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+    params.push(parseInt(limit), offset);
+    
+    const result = await db.query(query, params);
+    
+    res.json({
+      logs: result.rows,
+      count: result.rows.length
+    });
+  } catch (error) {
+    console.error('Activity logs error:', error);
+    res.status(500).json({ error: 'Failed to fetch activity logs' });
+  }
+});
+
+// Helper functions
+async function logActivity(userId, role, actionType, details) {
+  try {
+    await db.query(
+      'INSERT INTO activity_logs (user_id, role, action_type, details_json, timestamp, ip) VALUES ($1, $2, $3, $4, NOW(), $5)',
+      [userId, role, actionType, JSON.stringify(details), details.ip || 'unknown']
+    );
+  } catch (error) {
+    console.error('Activity log error:', error);
+  }
+}
+
+async function checkServiceAccess(userId, role, serviceNo) {
+  if (role === 'ADMIN') return true;
+  
+  const userResult = await db.query('SELECT * FROM users WHERE id = $1', [userId]);
+  const user = userResult.rows[0];
+  
+  if (role === 'MSP') {
+    const result = await db.query(
+      'SELECT 1 FROM master_data WHERE service_no = $1 AND msp_name = $2',
+      [serviceNo, user.name]
+    );
+    return result.rows.length > 0;
+  }
+  
+  if (role === 'TL') {
+    const result = await db.query(
+      'SELECT 1 FROM master_data WHERE service_no = $1 AND tl_name = $2',
+      [serviceNo, user.name]
+    );
+    return result.rows.length > 0;
+  }
+  
+  return false;
+}
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// Start server
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+
+module.exports = app;
